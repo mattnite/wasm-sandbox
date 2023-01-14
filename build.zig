@@ -4,9 +4,15 @@ pub fn build(b: *std.build.Builder) !void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
 
+    const zig_wasi_shim = b.addStaticLibrary("wasi-shim", "src/wasi_shim.zig");
+    zig_wasi_shim.setTarget(target);
+    zig_wasi_shim.setBuildMode(mode);
+    zig_wasi_shim.addIncludePath("deps/wasm3/source");
+
     const wasm3 = b.addExecutable("wasm3", null);
     wasm3.setTarget(target);
     wasm3.setBuildMode(mode);
+    wasm3.linkLibrary(zig_wasi_shim);
     wasm3.install();
     wasm3.linkLibC();
 
@@ -17,10 +23,10 @@ pub fn build(b: *std.build.Builder) !void {
     wasm3.addIncludePath("source");
     wasm3.addCSourceFiles(&.{
         "deps/wasm3/source/m3_api_libc.c",
-        "deps/wasm3/source/m3_api_meta_wasi.c",
+        //"deps/wasm3/source/m3_api_meta_wasi.c",
         "deps/wasm3/source/m3_api_tracer.c",
-        "deps/wasm3/source/m3_api_uvwasi.c",
-        "deps/wasm3/source/m3_api_wasi.c",
+        //"deps/wasm3/source/m3_api_uvwasi.c",
+        //"deps/wasm3/source/m3_api_wasi.c",
         "deps/wasm3/source/m3_bind.c",
         "deps/wasm3/source/m3_code.c",
         "deps/wasm3/source/m3_compile.c",
