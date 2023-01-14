@@ -1,34 +1,45 @@
 const std = @import("std");
 
-pub fn build(b: *std.build.Builder) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
+pub fn build(b: *std.build.Builder) !void {
     const target = b.standardTargetOptions(.{});
-
-    // Standard release options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("wasm-sandbox", "src/main.zig");
-    exe.setTarget(target);
-    exe.setBuildMode(mode);
-    exe.install();
+    const wasm3 = b.addExecutable("wasm3", null);
+    wasm3.setTarget(target);
+    wasm3.setBuildMode(mode);
+    wasm3.install();
+    wasm3.linkLibC();
 
-    const run_cmd = exe.run();
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    if (target.getCpuArch() == .wasm32 and target.getOsTag() == .wasi) {
+        wasm3.linkSystemLibrary("wasi-emulated-process-clocks");
     }
 
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
+    wasm3.addIncludePath("source");
+    wasm3.addCSourceFiles(&.{
+        "deps/wasm3/source/m3_api_libc.c",
+        "deps/wasm3/source/m3_api_meta_wasi.c",
+        "deps/wasm3/source/m3_api_tracer.c",
+        "deps/wasm3/source/m3_api_uvwasi.c",
+        "deps/wasm3/source/m3_api_wasi.c",
+        "deps/wasm3/source/m3_bind.c",
+        "deps/wasm3/source/m3_code.c",
+        "deps/wasm3/source/m3_compile.c",
+        "deps/wasm3/source/m3_core.c",
+        "deps/wasm3/source/m3_env.c",
+        "deps/wasm3/source/m3_exec.c",
+        "deps/wasm3/source/m3_function.c",
+        "deps/wasm3/source/m3_info.c",
+        "deps/wasm3/source/m3_module.c",
+        "deps/wasm3/source/m3_parse.c",
+        "deps/wasm3/platforms/app/main.c",
+    }, &.{
+        "-I./deps/wasm3/source",
+        "-Dd_m3HasWASI",
+        "-fno-sanitize=undefined", // TODO investigate UB sites in the codebase, then delete this line.
+    });
 
-    const exe_tests = b.addTest("src/main.zig");
-    exe_tests.setTarget(target);
-    exe_tests.setBuildMode(mode);
-
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&exe_tests.step);
+    const exe = b.addExecutable("hello", "src/main.zig");
+    exe.setTarget(std.zig.CrossTarget{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    exe.setBuildMode(.ReleaseSmall);
+    exe.install();
 }
