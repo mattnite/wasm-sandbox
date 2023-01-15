@@ -29,6 +29,7 @@ const Error = LinkError || Traps;
 const Traps = error{
     TrapExit,
     TrapAbort,
+    TrapOutOfBoundsMemoryAccess,
 };
 
 const LinkError = error{
@@ -72,6 +73,7 @@ fn errorToResult(err: Error) c.M3Result {
         // traps
         error.TrapExit => c.m3Err_trapExit,
         error.TrapAbort => c.m3Err_trapAbort,
+        error.TrapOutOfBoundsMemoryAccess => c.m3Err_trapOutOfBoundsMemoryAccess,
     };
 }
 
@@ -83,20 +85,17 @@ const Module = opaque {
         function_name: [:0]const u8,
         comptime function: anytype,
     ) LinkError!void {
-        const signature = M3Signature.init(@TypeOf(function));
+        const signature = Signature.init(@TypeOf(function));
         const raw_function = m3RawFunction(function);
-        std.log.info("signature: {s}", .{signature.toString()});
-
-        const result = c.m3_LinkRawFunction(
+        if (linkErrorFromResult(c.m3_LinkRawFunction(
             @ptrCast(c.IM3Module, module),
             module_name.ptr,
             function_name.ptr,
             signature.toString().ptr,
             raw_function,
-        );
-
-        if (linkErrorFromResult(result)) |err|
+        ))) |err| {
             return err;
+        }
     }
 
     fn linkExtra(
@@ -106,8 +105,7 @@ const Module = opaque {
         userdata: ?*anyopaque,
         comptime function: anytype,
     ) LinkError!void {
-        const signature = M3Signature.init(@TypeOf(function));
-        std.log.info("signature: {s}", .{signature.toString()});
+        const signature = Signature.init(@TypeOf(function));
         const raw_function = m3RawFunction(function);
         if (linkErrorFromResult(c.m3_LinkRawFunctionEx(
             @ptrCast(c.IM3Module, module),
@@ -147,25 +145,24 @@ const Module = opaque {
     }
 };
 
-const M3Signature = struct {
+const Signature = struct {
     return_type: ?type,
     params: []const std.builtin.Type.Fn.Param,
 
-    fn init(comptime Fn: type) M3Signature {
+    fn init(comptime Fn: type) Signature {
         const type_info = @typeInfo(Fn);
 
-        assert(type_info.Fn.params[0].type.? == *c.M3Runtime);
-        assert(type_info.Fn.params[1].type.? == *c.M3ImportContext);
+        assert(type_info.Fn.params[0].type.? == Context);
 
         const eu_info = @typeInfo(type_info.Fn.return_type.?).ErrorUnion;
         assert(Error == eu_info.error_set);
-        return M3Signature{
+        return Signature{
             .return_type = eu_info.payload,
-            .params = type_info.Fn.params[2..],
+            .params = type_info.Fn.params[1..],
         };
     }
 
-    fn toString(comptime signature: M3Signature) [:0]const u8 {
+    fn toString(comptime signature: Signature) [:0]const u8 {
         comptime var ret: [:0]const u8 = switch (signature.return_type.?) {
             u32 => "i",
             void => "v",
@@ -192,19 +189,61 @@ const M3Signature = struct {
     }
 };
 
-fn m3ApiOffsetToPtr(comptime T: type, memory: *anyopaque, sp: *[*]u64) T {
-    const type_info = @typeInfo(T);
-    assert(type_info == .Pointer);
+const Context = struct {
+    runtime: *c.M3Runtime,
+    import: *c.M3ImportContext,
+    memory: *anyopaque,
 
-    const offset = @ptrCast(*u32, sp).*;
-    sp.* += @sizeOf(u64);
+    fn offsetToPtr(ctx: Context, comptime T: type, sp: *[*]u64) T {
+        const type_info = @typeInfo(T);
+        assert(type_info == .Pointer);
 
-    const mem = @ptrCast([*]u8, memory);
-    return @ptrCast(T, @alignCast(@alignOf(T), mem + offset));
-}
+        const offset = @ptrCast(*u32, sp).*;
+        sp.* += @sizeOf(u64);
+
+        const mem = @ptrCast([*]u8, @alignCast(1, ctx.memory));
+        return @ptrCast(T, @alignCast(@alignOf(T), mem + offset));
+    }
+
+    fn ptrToOffset(ctx: Context, ptr: anytype) u32 {
+        _ = ctx;
+        const type_info = @typeInfo(@TypeOf(ptr));
+        assert(type_info == .Pointer);
+
+        // TODO: bounds checking
+    }
+
+    // TODO: endianness
+    // TODO: reveal
+    fn read(ctx: Context, comptime T: type, ptr: *anyopaque) !T {
+        // TODO: bounds checking
+        _ = ctx;
+        return @ptrCast(*T, @alignCast(@alignOf(T), ptr)).*;
+    }
+
+    fn write(ctx: Context, ptr: *anyopaque, val: anytype) void {
+        const type_info = @typeInfo(@TypeOf(ptr));
+        assert(type_info == .Pointer);
+
+        _ = ctx;
+        _ = val;
+        // TODO: implement
+    }
+
+    fn check(ctx: Context, address: *anyopaque, length: u64) Error!void {
+        const size = c.m3_GetMemorySize(ctx.runtime);
+        const memory_begin = @ptrToInt(address);
+        const memory_end = @ptrToInt(ctx.memory) + size;
+        const begin = @ptrToInt(address);
+        const end = @ptrToInt(address) + length;
+
+        if (begin < memory_begin or end > memory_end)
+            return error.TrapOutOfBoundsMemoryAccess;
+    }
+};
 
 fn m3RawFunction(comptime function: anytype) RawCall {
-    const signature = M3Signature.init(@TypeOf(function));
+    const signature = Signature.init(@TypeOf(function));
     var fields: [signature.params.len]StructField = undefined;
     for (signature.params) |param, i|
         fields[i] = StructField{
@@ -228,9 +267,9 @@ fn m3RawFunction(comptime function: anytype) RawCall {
     return struct {
         fn tmp(
             runtime: c.IM3Runtime,
-            import_context: c.IM3ImportContext,
+            import: c.IM3ImportContext,
             stack_pointer: ?[*]u64,
-            memory: ?*anyopaque,
+            raw_memory: ?*anyopaque,
         ) callconv(.C) ?*const anyopaque {
             var sp = stack_pointer.?;
             const Return = signature.return_type.?;
@@ -241,23 +280,25 @@ fn m3RawFunction(comptime function: anytype) RawCall {
 
                 break :return_loc ret;
             } else {};
+            const ctx = Context{
+                .runtime = @ptrCast(*c.M3Runtime, runtime),
+                .import = @ptrCast(*c.M3ImportContext, import),
+                .memory = raw_memory.?,
+            };
 
             var args: ArgsTuple = undefined;
             inline for (args) |_, i| {
                 const Arg = @TypeOf(args[i]);
                 const arg_info = @typeInfo(Arg);
                 if (arg_info == .Pointer) {
-                    args[i] = m3ApiOffsetToPtr(Arg, memory.?, &sp);
+                    args[i] = ctx.offsetToPtr(Arg, &sp);
                 } else {
                     args[i] = @ptrCast(*Arg, sp).*;
                     sp += @sizeOf(u64);
                 }
             }
 
-            const err_union = @call(.auto, function, .{
-                @ptrCast(*c.M3Runtime, runtime),
-                @ptrCast(*c.M3ImportContext, import_context),
-            } ++ args);
+            const err_union = @call(.auto, function, .{ctx} ++ args);
             return if (Return != void) ret: {
                 return_loc.* = err_union catch |err| {
                     break :ret errorToResult(err);
@@ -288,20 +329,14 @@ fn linkWASI(module: *Module) !void {
     try module.linkIgnoreLookupFailure("wasi_snapshot_preview1", "fd_seek", snapshot_preview1_fd_seek);
     inline for (@typeInfo(functions).Struct.decls) |decl| {
         const decl_name = std.fmt.comptimePrint("{s}", .{decl.name});
-
-        for (namespaces) |ns| {
-            std.log.debug("ns: {s}, decl_name: {s}", .{ ns, decl_name });
+        for (namespaces) |ns|
             try module.linkIgnoreLookupFailure(ns, decl_name, @field(functions, decl.name));
-        }
     }
 
     inline for (@typeInfo(functions_extra).Struct.decls) |decl| {
         const decl_name = std.fmt.comptimePrint("{s}", .{decl.name});
-
-        for (namespaces) |ns| {
-            std.log.debug("ns: {s}, decl_name: {s}", .{ ns, decl_name });
+        for (namespaces) |ns|
             try module.linkExtraIgnoreLookupFailure(ns, decl_name, wasi_context, @field(functions_extra, decl.name));
-        }
     }
 }
 
@@ -316,15 +351,13 @@ export fn m3_LinkWASI(module: *Module) c.M3Result {
 // implementations
 //==============================================================================
 fn unstable_fd_seek(
-    runtime: *c.M3Runtime,
-    import_context: *c.M3ImportContext,
+    ctx: Context,
     fd: c.__wasi_fd_t,
     offset: c.__wasi_filedelta_t,
     wasi_whence: u32,
     result: *c.__wasi_filesize_t,
 ) Error!u32 {
-    _ = runtime;
-    _ = import_context;
+    _ = ctx;
     _ = fd;
     _ = offset;
     _ = wasi_whence;
@@ -333,15 +366,13 @@ fn unstable_fd_seek(
 }
 
 fn snapshot_preview1_fd_seek(
-    runtime: *c.M3Runtime,
-    import_context: *c.M3ImportContext,
+    ctx: Context,
     fd: c.__wasi_fd_t,
     offset: c.__wasi_filedelta_t,
     wasi_whence: u32,
     result: *c.__wasi_filesize_t,
 ) Error!u32 {
-    _ = runtime;
-    _ = import_context;
+    _ = ctx;
     _ = fd;
     _ = offset;
     _ = wasi_whence;
@@ -351,32 +382,55 @@ fn snapshot_preview1_fd_seek(
 
 const functions = struct {
     fn fd_write(
-        runtime: *c.M3Runtime,
-        import_context: *c.M3ImportContext,
+        ctx: Context,
         fd: c.__wasi_fd_t,
-        wasi_iovs: *wasi.iovec_t,
+        wasi_iovs: [*]wasi.iovec_t,
         iovs_len: u32,
         nwritten: *c.__wasi_size_t,
     ) Error!u32 {
-        _ = runtime;
-        _ = import_context;
-        _ = fd;
-        _ = wasi_iovs;
-        _ = iovs_len;
-        _ = nwritten;
-        return error.TrapAbort;
+        if (@hasDecl(c, "HAS_IOVEC"))
+            @compileError("TODO");
+
+        // TODO: this function will end up causing hello world to run infinitely
+        _ = ctx;
+
+        std.log.debug("fd: {}, wasi_iovs: {*}, iovs_len: {}, nwritten: {*}", .{
+            fd,
+            wasi_iovs,
+            iovs_len,
+            nwritten,
+        });
+
+        //const iovs = wasi_iovs[0..iovs_len];
+        //var res: u32 = 0;
+        //for (iovs) |iov| {
+        //    const addr = try ctx.offsetToPtr(try ctx.read(u32, iov.buf));
+        //    const len = try ctx.read(u32, iov.buf_len);
+
+        //    if (len == 0)
+        //        continue;
+
+        //    // TODO: write to file, report errors if any
+        //    _ = addr;
+
+        //    res += len;
+        //}
+
+        //try ctx.write(u32, nwritten, res);
+
+        return 0;
     }
 };
 
 const functions_extra = struct {
     fn proc_exit(
-        runtime: *c.M3Runtime,
-        import_context: *c.M3ImportContext,
+        ctx: Context,
         code: u32,
     ) Error!void {
-        _ = runtime;
-
-        const context = @ptrCast(*c.m3_wasi_context_t, @alignCast(@alignOf(*c.m3_wasi_context_t), import_context.userdata));
+        const context = @ptrCast(
+            *c.m3_wasi_context_t,
+            @alignCast(@alignOf(*c.m3_wasi_context_t), ctx.import.userdata),
+        );
         context.exit_code = @intCast(i32, code);
 
         return error.TrapExit;
