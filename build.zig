@@ -8,6 +8,8 @@ pub fn build(b: *std.build.Builder) !void {
     zig_wasi_shim.setTarget(target);
     zig_wasi_shim.setBuildMode(mode);
     zig_wasi_shim.addIncludePath("deps/wasm3/source");
+    zig_wasi_shim.addIncludePath("deps/wasm3/source/extra");
+    zig_wasi_shim.linkLibC();
 
     const wasm3 = b.addExecutable("wasm3", null);
     wasm3.setTarget(target);
